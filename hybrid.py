@@ -50,6 +50,7 @@ class Config:
     TEMPERATURE = 1.2  # Like avataRL
     CLIP_RATIO = 0.5   # PPO-style clipping
     ENTROPY_COEF = 0.01
+    ENTROPY_FLOOR = 1.5 # NEW: Hard floor for entropy to combat mode collapse
     
     # Exhaustive exploration (avataRL style)
     USE_EXHAUSTIVE = True
@@ -781,9 +782,10 @@ class HybridTrainer:
             })
             wandb.log(logs)
             
-            # Generate sample text every 50 iterations
-            if iteration % 50 == 0:
+            # Generate and print sample text periodically
+            if iteration > 0 and iteration % 250 == 0: # Print every 250 steps
                 sample_text = self._generate_sample()
+                print(f"\n--- Sample at step {iteration} ---\n{sample_text}\n--------------------------")
                 logs['samples/generated_text'] = sample_text
                 wandb.log({'samples/generated_text': sample_text})
         
@@ -840,12 +842,18 @@ class HybridTrainer:
         advantages = rewards - rewards.mean(dim=1, keepdim=True)  # Baseline subtraction
         policy_loss = -(current_log_probs * advantages).mean()
         
-        # Add entropy regularization
+        # Add entropy regularization AND floor
         probs = F.softmax(logits[:, -1, :], dim=-1)
         entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=-1).mean()
-        entropy_loss = -C.ENTROPY_COEF * entropy
         
+        # Standard entropy bonus
+        entropy_loss = -C.ENTROPY_COEF * entropy
         total_loss = policy_loss + entropy_loss
+
+        # NEW: Aggressive entropy floor penalty
+        if entropy < C.ENTROPY_FLOOR:
+            entropy_penalty = (C.ENTROPY_FLOOR - entropy) * 5.0 # Strong penalty
+            total_loss += entropy_penalty
         
         # Optimize
         self.grpo_optimizer.zero_grad()
