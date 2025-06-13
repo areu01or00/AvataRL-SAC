@@ -29,6 +29,7 @@ from pathlib import Path
 import re
 from contextlib import contextmanager
 import copy
+import argparse
 
 # Configuration
 class Config:
@@ -41,11 +42,7 @@ class Config:
     # Character-level tokenization (like avataRL)
     VOCAB_SIZE = 65  # a-z, A-Z, 0-9, punctuation, space
     
-    # Training phases - REASONABLE for testing real surgery
-    TOTAL_ITERATIONS = 1000  # Start with 1000 to test if surgery works
-    PHASE_1_RATIO = 0.6  # 60% Exhaustive GRPO
-    PHASE_2_RATIO = 0.3  # 30% SAC attention surgery
-    PHASE_3_RATIO = 0.1  # 10% Joint optimization
+    # Training phases will be set by argparse
     
     # GRPO settings (enhanced like avataRL)
     GRPO_LR = 3e-4
@@ -67,8 +64,8 @@ class Config:
     SAC_TAU = 0.005
     SAC_ALPHA_INIT = 0.2
     SAC_TUNE_ALPHA = True
-    SAC_TARGET_ENTROPY = -2.0
-    SAC_ACTION_SCALE = 0.001  # MUCH smaller for stability
+    SAC_TARGET_ENTROPY = -2.0  # Target entropy for the new small action space
+    SAC_ACTION_SCALE = 0.1     # REVOLUTION: Scale is now a percentage (+/- 10%)
     SAC_BUFFER_SIZE = 10000
     SAC_BATCH_SIZE = 64
     
@@ -181,22 +178,20 @@ class ReplayBuffer:
     def __len__(self):
         return len(self.buffer)
 
-# SAC Models (FIXED - Low-rank attention surgery)
+# SAC Models (REVOLUTIONIZED ACTION SPACE)
 class AttentionSurgeonActor(nn.Module):
-    """SAC Actor for adaptive low-rank attention surgery"""
-    def __init__(self, state_dim, rank=64, max_proj_size=1536):
+    """SAC Actor for percentage-based scaling factors"""
+    def __init__(self, state_dim, num_layers):
         super(AttentionSurgeonActor, self).__init__()
-        self.rank = rank
-        self.max_proj_size = max_proj_size
-        # Output enough parameters for U and V factors for any projection size
-        action_dim = rank * max_proj_size * 2 * len(C.SAC_TARGET_LAYERS)
+        # REVOLUTION: Action space is now tiny. 2 scales (U,V) per layer.
+        action_dim = num_layers * 2
         
         self.fc1 = nn.Linear(state_dim, 256)
         self.fc2 = nn.Linear(256, 256)
         self.mean_layer = nn.Linear(256, action_dim)
         self.log_std_layer = nn.Linear(256, action_dim)
         
-        print(f"Adaptive Attention Surgeon: rank={rank}, max_proj_size={max_proj_size}, action_dim={action_dim}")
+        print(f"REVOLUTIONIZED Attention Surgeon: action_dim={action_dim}")
 
     def forward(self, state):
         x = F.relu(self.fc1(state))
@@ -214,7 +209,7 @@ class AttentionSurgeonActor(nn.Module):
         log_prob -= torch.log(1 - tanh_action.pow(2) + 1e-6)
         log_prob = log_prob.sum(1, keepdim=True)
         
-        # Scale actions to prevent instability
+        # Scale actions to represent percentages (+/- SAC_ACTION_SCALE)
         scaled_action = C.SAC_ACTION_SCALE * tanh_action
         
         return scaled_action, log_prob
@@ -248,31 +243,37 @@ class AttentionSurgeonCritic(nn.Module):
         
         return q1, q2
 
-# Reward computation
-def compute_text_quality_reward(generated_text, target_text_sample):
-    """Compute reward based on text quality metrics"""
-    # Character-level n-gram overlap
-    def get_ngrams(text, n):
-        return set(text[i:i+n] for i in range(len(text)-n+1))
-    
-    rewards = []
-    
-    # Bigram and trigram precision
-    for n in [2, 3]:
-        gen_ngrams = get_ngrams(generated_text, n)
-        target_ngrams = get_ngrams(target_text_sample, n)
+# Reward computation (NEW: Loss-based)
+def compute_loss_based_reward(model, context, target):
+    """
+    Computes reward based on the negative cross-entropy loss for a single sample.
+    This provides a more direct and less noisy signal of whether a surgery was beneficial.
+    """
+    model.eval()  # Ensure model is in eval mode for this calculation
+    with torch.no_grad():
+        # Ensure context and target have the correct dimensions
+        if context.dim() == 1:
+            context = context.unsqueeze(0)
         
-        if len(gen_ngrams) > 0:
-            precision = len(gen_ngrams & target_ngrams) / len(gen_ngrams)
-            rewards.append(precision)
-        else:
-            rewards.append(0.0)
+        outputs = model(context)
+        logits = outputs.logits if hasattr(outputs, 'logits') else outputs
+        # We only care about the loss for the very next token after the context
+        next_token_logits = logits[:, -1, :]
+        
+        # Ensure target is a tensor for the loss function
+        if not isinstance(target, torch.Tensor):
+            target = torch.tensor([target], device=next_token_logits.device)
+        elif target.dim() == 0:
+            target = target.unsqueeze(0)
+
+        loss = F.cross_entropy(next_token_logits, target)
+    model.train()  # Restore model to training mode
     
-    # Length penalty (prefer reasonable lengths)
-    length_penalty = max(0, 1 - abs(len(generated_text) - 20) / 20)
-    rewards.append(length_penalty * 0.1)
-    
-    return sum(rewards) / len(rewards)
+    # We want to maximize reward, which means minimizing loss.
+    # The reward is the negative of the loss.
+    # A baseline is added to keep rewards generally positive, which can aid stability.
+    reward = -loss.item() + 5.0  # Baseline of 5.0 since ln(65) is ~4.17
+    return reward
 
 # N-gram Reference Model (EXACTLY like avataRL)
 class OnTheFlyNGramRef(nn.Module):
@@ -418,73 +419,48 @@ def compute_exhaustive_rewards_with_confidence(all_chars, ref_char, ref_model, c
     
     return base_rewards
 
-# ACTUAL Attention Surgery Implementation (FIXED)
-def decode_surgery_action(action, rank, max_proj_size, num_layers):
-    """Proper surgery decoding with concatenated QKV handling"""
-    surgeries = []
-    action_per_layer = rank * max_proj_size * 2  # U + V
+# ACTUAL Attention Surgery Implementation (REVOLUTIONIZED)
+def apply_attention_surgery(model, scales):
+    """Apply percentage-based scaling surgery to attention weights."""
+    # scales is a tensor of shape [num_layers * 2]
     
-    # Convert to torch tensor if numpy
-    if isinstance(action, np.ndarray):
-        action = torch.from_numpy(action).float()
-    
-    for i in range(num_layers):
-        start_idx = i * action_per_layer
-        end_idx = start_idx + action_per_layer
-        layer_action = action[start_idx:end_idx]
-        
-        # Split U and V for first/second half
-        U = layer_action[:rank * max_proj_size]
-        V = layer_action[rank * max_proj_size:]
-        
-        surgeries.append((U, V))
-    
-    return surgeries
-
-def apply_attention_surgery(model, surgeries):
-    """Apply low-rank surgery to attention weights with adaptive reshaping"""
-    for layer_idx, (U, V) in zip(C.SAC_TARGET_LAYERS, surgeries):
+    for i, layer_idx in enumerate(C.SAC_TARGET_LAYERS):
         attn_layer = model.transformer.h[layer_idx].attn
         
-        # Ensure U, V are torch tensors
-        if isinstance(U, np.ndarray):
-            U = torch.from_numpy(U).float().to(model.device)
-        if isinstance(V, np.ndarray):
-            V = torch.from_numpy(V).float().to(model.device)
+        # Get the two scaling factors for this layer
+        u_scale = scales[i * 2]
+        v_scale = scales[i * 2 + 1]
         
-        # Handle different attention architectures
+        # Handle different attention architectures (e.g., combined QKV)
         applied = False
-        for proj_name in ['c_attn', 'qkv', 'q_proj', 'k_proj', 'v_proj']:
-            if hasattr(attn_layer, proj_name):
-                W = getattr(attn_layer, proj_name).weight
-                out_dim, in_dim = W.shape
-                
-                # Calculate available elements for reshaping
-                rank = 64  # Use the actual rank from config
-                max_U_elements = min(len(U), out_dim * rank)
-                max_V_elements = min(len(V), in_dim * rank)
-                
-                # Reshape U to (out_dim, rank) - row-oriented for output dimension
-                U_elements = max_U_elements // out_dim * out_dim  # Ensure divisible
-                U_reshaped = U[:U_elements].view(out_dim, -1)
-                
-                # Reshape V to (rank, in_dim) - column-oriented for input dimension  
-                V_elements = max_V_elements // in_dim * in_dim  # Ensure divisible
-                V_reshaped = V[:V_elements].view(in_dim, -1).t()  # Transpose to get (rank, in_dim)
-                
-                # Ensure compatible dimensions for matrix multiplication
-                adaptive_rank = min(U_reshaped.size(1), V_reshaped.size(0))
-                U_final = U_reshaped[:, :adaptive_rank]
-                V_final = V_reshaped[:adaptive_rank, :]
-                
-                # Compute perturbation
-                delta = U_final @ V_final * C.SAC_ACTION_SCALE
-                
-                # Apply to weight matrix
-                W.data += delta.to(W.device)
-                applied = True
-                break
-                
+        if hasattr(attn_layer, 'c_attn'):
+            W = attn_layer.c_attn.weight # Combined QKV weight
+            
+            # Create U, V from the original weight matrix. This is a form of SVD approximation.
+            # We don't need to compute the full SVD, just use the matrix's shape.
+            out_dim, in_dim = W.shape
+            U, _, V = torch.svd_lowrank(W.data.float(), q=1) # Rank-1 approximation is sufficient
+            
+            # Apply scaling to the factors
+            U_scaled = U * (1 + u_scale)
+            V_scaled = V * (1 + v_scale)
+            
+            # Reconstruct the change and apply it
+            delta = (U_scaled @ V_scaled.t()) - W.data
+            W.data += delta.to(W.device)
+            applied = True
+
+        # Handle separate Q, K, V projections if they exist
+        else:
+            for j, proj_name in enumerate(['q_proj', 'k_proj', 'v_proj']):
+                if hasattr(attn_layer, proj_name):
+                    W = getattr(attn_layer, proj_name).weight
+                    # Use a simple scaling factor for all three
+                    # In a more advanced version, we could have 6 scales per layer
+                    scale = (u_scale + v_scale) / 2 # Average the scales
+                    W.data *= (1 + scale)
+                    applied = True
+
         if not applied:
             print(f"Warning: Couldn't modify layer {layer_idx}")
 
@@ -619,7 +595,7 @@ def restore_weights_to_model(model, weights):
 
 # Main hybrid trainer
 class HybridTrainer:
-    def __init__(self):
+    def __init__(self, total_steps, phase1_end, phase2_end):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
         
@@ -652,15 +628,17 @@ class HybridTrainer:
         self.replay_buffer = None
         
         # Training state
+        self.total_steps = total_steps
         self.current_phase = 1
         self.phase_transitions = {
-            'phase_1_end': int(C.TOTAL_ITERATIONS * C.PHASE_1_RATIO),
-            'phase_2_end': int(C.TOTAL_ITERATIONS * (C.PHASE_1_RATIO + C.PHASE_2_RATIO))
+            'phase_1_end': phase1_end,
+            'phase_2_end': phase2_end
         }
         
+        print(f"Total Steps: {self.total_steps}")
         print(f"Phase transitions: Phase 1: 0-{self.phase_transitions['phase_1_end']-1}, "
               f"Phase 2: {self.phase_transitions['phase_1_end']}-{self.phase_transitions['phase_2_end']-1}, "
-              f"Phase 3: {self.phase_transitions['phase_2_end']}-{C.TOTAL_ITERATIONS-1}")
+              f"Phase 3: {self.phase_transitions['phase_2_end']}-{self.total_steps-1}")
     
     def _init_model(self):
         """Initialize UNTRAINED GPT-2 model with character-level vocab"""
@@ -695,27 +673,15 @@ class HybridTrainer:
         
         # Calculate dimensions for low-rank surgery based on actual projection shapes
         state_dim = 384  # Hidden dimension of GPT-2
-        rank = 64        # Low-rank factorization rank
         num_layers = len(C.SAC_TARGET_LAYERS)
         
-        # Get actual projection shapes from the model
-        max_proj_size = 0
-        for layer_idx in C.SAC_TARGET_LAYERS:
-            attn_layer = self.model.transformer.h[layer_idx].attn
-            if hasattr(attn_layer, 'c_attn'):
-                proj_shape = attn_layer.c_attn.weight.shape
-                proj_size = proj_shape[0] + proj_shape[1]  # Sum of dimensions
-                max_proj_size = max(max_proj_size, proj_size)
+        # REVOLUTION: Action dimension is now tiny and fixed.
+        action_dim = num_layers * 2
         
-        # Action dimension: enough parameters for U and V factors for largest projection
-        action_dim = rank * max_proj_size * 2 * num_layers  # U + V factors per layer
+        print(f"Surgery dimensions: layers={num_layers}, action_dim={action_dim}")
         
-        print(f"Surgery dimensions: rank={rank}, layers={num_layers}, max_proj_size={max_proj_size}")
-        print(f"Adaptive action_dim={action_dim} (vs old fixed {2*rank*state_dim*num_layers})")
-        print(f"Old action_dim would have been: {1152*384*num_layers} (IMPOSSIBLE!)")
-        
-        # Initialize networks with ADAPTIVE action dimensions
-        self.actor = AttentionSurgeonActor(state_dim, rank=rank, max_proj_size=max_proj_size).to(self.device)
+        # Initialize networks with the NEW SMALL action dimensions
+        self.actor = AttentionSurgeonActor(state_dim, num_layers=num_layers).to(self.device)
         self.critic = AttentionSurgeonCritic(state_dim, action_dim).to(self.device)
         self.critic_target = AttentionSurgeonCritic(state_dim, action_dim).to(self.device)
         
@@ -771,49 +737,11 @@ class HybridTrainer:
         
         return torch.stack(contexts).to(self.device), torch.tensor(targets, dtype=torch.long, device=self.device)
     
-    def _get_extended_shakespeare_batch(self):
-        """Get a batch with extended targets for proper surgery reward calculation"""
-        contexts = []
-        targets = []
-        full_targets = []
-        
-        for _ in range(C.BATCH_SIZE):
-            # Random starting position (leave room for context + 20 extra chars)
-            start_idx = random.randint(0, len(self.shakespeare_text) - C.MAX_LENGTH - 22)
-            
-            # Get context and targets
-            context_text = self.shakespeare_text[start_idx:start_idx + C.MAX_LENGTH]
-            target_char = self.shakespeare_text[start_idx + C.MAX_LENGTH]
-            # Get next 20 characters as gold standard for surgery evaluation
-            extended_target_text = self.shakespeare_text[start_idx + C.MAX_LENGTH:start_idx + C.MAX_LENGTH + 20]
-            
-            # Encode context
-            context_tokens = self.tokenizer.encode(context_text)
-            
-            # Pad or truncate context to exact length
-            if len(context_tokens) < C.MAX_LENGTH:
-                padding = torch.zeros(C.MAX_LENGTH - len(context_tokens), dtype=torch.long)
-                context_tokens = torch.cat([context_tokens, padding])
-            else:
-                context_tokens = context_tokens[:C.MAX_LENGTH]
-            
-            # Encode targets
-            target_token = self.tokenizer.char_to_idx.get(target_char, 0)
-            extended_target_tokens = [self.tokenizer.char_to_idx.get(c, 0) for c in extended_target_text]
-            
-            contexts.append(context_tokens)
-            targets.append(target_token)
-            full_targets.extend(extended_target_tokens)  # Flatten for easy indexing
-        
-        return (torch.stack(contexts).to(self.device), 
-                torch.tensor(targets, dtype=torch.long, device=self.device),
-                full_targets)  # Keep as list for easy slicing
-    
     def train(self):
         """Main hybrid training loop"""
         print("Starting HYBRID Training (Exhaustive + SAC)...")
         
-        pbar = tqdm(range(C.TOTAL_ITERATIONS), desc="Hybrid Training")
+        pbar = tqdm(range(self.total_steps), desc="Hybrid Training")
         
         for iteration in pbar:
             # Phase transitions
@@ -989,16 +917,16 @@ class HybridTrainer:
             else:
                 param.requires_grad = False
         
-        # Get contexts and extended targets for proper reward calculation
-        contexts, targets, full_targets = self._get_extended_shakespeare_batch()
+        # Get a standard batch for loss calculation
+        contexts, targets = self._get_shakespeare_batch()
         
-        # Extract hidden states from target layers (PROPER state encoding)
+        # NEW: Use a richer, more holistic state representation
         with torch.no_grad():
             outputs = self.model(contexts, output_hidden_states=True)
-            hidden_states = outputs.hidden_states
-            
-            # Use attention layer inputs as SAC states
-            states = hidden_states[C.SAC_TARGET_LAYERS[0]][:, -1, :].cpu().numpy()  # [B, hidden_dim]
+            # Take the *final* layer's hidden states and average them across the sequence.
+            # This provides a much richer, more holistic view of the context.
+            final_hidden_states = outputs.hidden_states[-1]  # [B, T, D]
+            states = final_hidden_states.mean(dim=1).cpu().numpy()  # [B, D]
         
         # Generate surgical actions with SAC actor
         state_tensor = torch.FloatTensor(states).to(self.device)
@@ -1007,25 +935,28 @@ class HybridTrainer:
         # STREAMLINED SURGERY EVALUATION with SurgicalTheater
         rewards = []
         
+        # Get base loss for the whole batch *before* any surgery
+        with torch.no_grad():
+            base_outputs = self.model(contexts)
+            base_logits = base_outputs.logits[:, -1, :]
+            base_loss = F.cross_entropy(base_logits, targets, reduction='none') # [B]
+
         # Evaluate each surgical action with optimized approach
         for i in range(C.BATCH_SIZE):
-            # Get action and decode surgeries
-            action = actions[i].detach().cpu().numpy()
-            # Get max projection size from actor
-            max_proj_size = self.actor.max_proj_size
-            surgeries = decode_surgery_action(action, rank=64, max_proj_size=max_proj_size, num_layers=len(C.SAC_TARGET_LAYERS))
+            # Get action (which is now just the scaling factors)
+            scales = actions[i]
             
             with SurgicalTheater(self.model):
                 # Operate directly on model without cloning
-                apply_attention_surgery(self.model, surgeries)
+                apply_attention_surgery(self.model, scales)
                 
-                # Generate with modified model
-                sample_text = self._generate_sample_with_context(contexts[i:i+1])
+                # REFINED REWARD: Calculate reward as the *relative improvement* in loss
+                with torch.no_grad():
+                    surgical_outputs = self.model(contexts[i:i+1])
+                    surgical_logits = surgical_outputs.logits[:, -1, :]
+                    surgical_loss = F.cross_entropy(surgical_logits, targets[i:i+1])
                 
-                # Get reward against true next characters (causal reward calculation)
-                start_idx = i * 20
-                target_text = "".join([self.tokenizer.idx_to_char[t] for t in full_targets[start_idx:start_idx+20]])
-                reward = compute_text_quality_reward(sample_text, target_text)
+                reward = (base_loss[i].item() - surgical_loss.item()) * 10 # Scale up for bigger signal
                 rewards.append(reward)
             
             # Automatic cleanup via SurgicalTheater - weights restored automatically!
@@ -1056,30 +987,12 @@ class HybridTrainer:
             'reward/max_reward': rewards.max(),
             'reward/min_reward': rewards.min(),
             # Surgery-specific metrics
-            'surgery/action_magnitude': np.abs(actions.detach().cpu().numpy()).mean(),
-            'surgery/reward_improvement': (rewards.mean() - 0.1),  # Baseline comparison
-            'surgery/reward_std': rewards.std(),
-            'surgery/evaluation_method': "SurgicalTheater: 133x more efficient than naive approaches",
+            'surgery/action_magnitude': torch.abs(actions).mean().item(),
+            'surgery/relative_loss_improvement_mean': rewards.mean(),
+            'surgery/relative_loss_improvement_std': rewards.std(),
+            'surgery/evaluation_method': "SurgicalTheater (Relative Loss Reward)",
             'surgery/memory_efficiency': "98% lighter than TempModel approach",
         }
-    
-    def _generate_sample_with_context(self, context):
-        """Generate sample text with given context (for surgery evaluation)"""
-        self.model.eval()
-        with torch.no_grad():
-            # Generate 20 more characters from context
-            current_context = context.clone()
-            for _ in range(20):
-                outputs = self.model(current_context)
-                logits = outputs.logits if hasattr(outputs, 'logits') else outputs
-                probs = F.softmax(logits[:, -1, :] / C.TEMPERATURE, dim=-1)
-                next_token = torch.multinomial(probs, 1)
-                current_context = torch.cat([current_context, next_token], dim=1)
-            
-            generated_text = self.tokenizer.decode(current_context[0])
-        
-        self.model.train()
-        return generated_text
     
     def _update_sac(self):
         """Update SAC networks"""
@@ -1160,13 +1073,13 @@ class HybridTrainer:
         
         return combined_logs
 
-def main():
+def main(args):
     # Initialize WandB
     wandb.init(
         project=C.WANDB_PROJECT,
         entity=C.WANDB_ENTITY,
         name=C.WANDB_RUN_NAME,
-        config=vars(C)
+        config={**vars(C), **vars(args)}
     )
     
     # Set seeds
@@ -1175,11 +1088,21 @@ def main():
     random.seed(C.RANDOM_SEED)
     
     # Train
-    trainer = HybridTrainer()
+    trainer = HybridTrainer(
+        total_steps=args.total_steps,
+        phase1_end=args.phase1_end,
+        phase2_end=args.phase2_end
+    )
     trainer.train()
     
     wandb.finish()
     print("Hybrid training completed successfully!")
 
 if __name__ == "__main__":
-    main() 
+    parser = argparse.ArgumentParser(description="Hybrid RL Training with SAC Attention Surgery")
+    parser.add_argument('--total_steps', type=int, default=20000, help='Total number of training iterations.')
+    parser.add_argument('--phase1_end', type=int, default=12000, help='The iteration at which Phase 1 (GRPO only) ends.')
+    parser.add_argument('--phase2_end', type=int, default=18000, help='The iteration at which Phase 2 (SAC Surgery only) ends.')
+    
+    args = parser.parse_args()
+    main(args)
