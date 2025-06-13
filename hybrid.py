@@ -74,7 +74,7 @@ class Config:
     
     # WandB settings
     WANDB_PROJECT = "AvataRL-SAC"
-    WANDB_ENTITY = "shreenivas-sangoram-self"
+    WANDB_ENTITY = None
     WANDB_RUN_NAME = "SURGICAL-THEATER-OPTIMIZED-v1"
     
     # Other
