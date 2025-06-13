@@ -65,7 +65,7 @@ class Config:
     SAC_ALPHA_INIT = 0.2
     SAC_TUNE_ALPHA = True
     SAC_TARGET_ENTROPY = -2.0  # Target entropy for the new small action space
-    SAC_ACTION_SCALE = 0.1     # REVOLUTION: Scale is now a percentage (+/- 10%)
+    SAC_ACTION_SCALE = 0.1     # Scale is now a percentage (+/- 10%)
     SAC_BUFFER_SIZE = 10000
     SAC_BATCH_SIZE = 64
     
@@ -178,12 +178,12 @@ class ReplayBuffer:
     def __len__(self):
         return len(self.buffer)
 
-# SAC Models (REVOLUTIONIZED ACTION SPACE)
+# SAC Models (ACTION IN ACTION SPACE)
 class AttentionSurgeonActor(nn.Module):
     """SAC Actor for percentage-based scaling factors"""
     def __init__(self, state_dim, num_layers):
         super(AttentionSurgeonActor, self).__init__()
-        # REVOLUTION: Action space is now tiny. 2 scales (U,V) per layer.
+        # Action space is now tiny. 2 scales (U,V) per layer.
         action_dim = num_layers * 2
         
         self.fc1 = nn.Linear(state_dim, 256)
@@ -191,7 +191,7 @@ class AttentionSurgeonActor(nn.Module):
         self.mean_layer = nn.Linear(256, action_dim)
         self.log_std_layer = nn.Linear(256, action_dim)
         
-        print(f"REVOLUTIONIZED Attention Surgeon: action_dim={action_dim}")
+        print(f"Attention Surgeon: action_dim={action_dim}")
 
     def forward(self, state):
         x = F.relu(self.fc1(state))
@@ -419,7 +419,7 @@ def compute_exhaustive_rewards_with_confidence(all_chars, ref_char, ref_model, c
     
     return base_rewards
 
-# ACTUAL Attention Surgery Implementation (REVOLUTIONIZED)
+# ACTUAL Attention Surgery Implementation 
 def apply_attention_surgery(model, scales):
     """Apply percentage-based scaling surgery to attention weights."""
     # scales is a tensor of shape [num_layers * 2]
@@ -675,7 +675,7 @@ class HybridTrainer:
         state_dim = 384  # Hidden dimension of GPT-2
         num_layers = len(C.SAC_TARGET_LAYERS)
         
-        # REVOLUTION: Action dimension is now tiny and fixed.
+        # Action dimension is now tiny and fixed.
         action_dim = num_layers * 2
         
         print(f"Surgery dimensions: layers={num_layers}, action_dim={action_dim}")
@@ -955,13 +955,24 @@ class HybridTrainer:
                     surgical_outputs = self.model(contexts[i:i+1])
                     surgical_logits = surgical_outputs.logits[:, -1, :]
                     surgical_loss = F.cross_entropy(surgical_logits, targets[i:i+1])
-                
-                reward = (base_loss[i].item() - surgical_loss.item()) * 10 # Scale up for bigger signal
+                    
+                    # NEW: Add an entropy bonus to the reward to encourage diversity
+                    probs = F.softmax(surgical_logits, dim=-1)
+                    entropy = -(probs * torch.log(probs + 1e-8)).sum().item()
+                    
+                    loss_improvement = (base_loss[i].item() - surgical_loss.item()) * 10 # Scale up
+                    
+                    # Combine loss improvement with entropy bonus
+                    reward = loss_improvement + (C.ENTROPY_COEF * entropy)
+
                 rewards.append(reward)
             
             # Automatic cleanup via SurgicalTheater - weights restored automatically!
         
         rewards = np.array(rewards)
+        
+        # NEW: Clip rewards to prevent instability from extreme values
+        rewards = np.clip(rewards, -10.0, 10.0) # Clip between -10 and 10
         
         # Store experience in replay buffer
         for i in range(C.BATCH_SIZE):
